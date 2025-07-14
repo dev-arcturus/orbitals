@@ -1,69 +1,72 @@
-# React + TypeScript + Vite
+# Quantum Orbital Visualizer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A modern, interactive web app for visualizing quantum atomic orbitals in 3D, built with React, Three.js, and Rust/WASM.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Real-time, interactive 3D visualization of hydrogen-like atomic orbitals
+- Adjustable quantum numbers (n, l, m) with beautiful, glassy UI
+- Point cloud rendering with scientific colormaps
+- Slicing plane for cross-sectional analysis
+- Camera auto-orbit with user interaction pause/resume
+- Modern, glassmorphic controls and settings panel
+- Responsive, high-performance rendering for large grids
+- WASM backend for fast quantum calculations
 
-## Expanding the ESLint configuration
+## Tech Stack
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- **Frontend:** React, Three.js, Framer Motion, Vite
+- **Backend (WASM):** Rust (computes ψₙₗₘ and |ψ|² on a 3D grid)
+- **Styling:** CSS, glassmorphism, modern math/science fonts
 
-```js
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+## Local Development
 
-      // Remove tseslint.configs.recommended and replace with this
-      ...tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      ...tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      ...tseslint.configs.stylisticTypeChecked,
+1. **Install dependencies:**
+   ```sh
+   npm install
+   ```
+2. **Start the dev server:**
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+   ```sh
+   npm run dev
+   ```
+
+   The app will be available at `http://localhost:5173` (or as shown in your terminal).
+
+3. **Build the WASM package:**
+   - Make sure the Rust WASM build outputs to `src/wasm_pkg/` and the `.wasm` file is accessible by the frontend.
+
+## Building for Production
+
+```sh
+npm run build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+- Output will be in the `dist/` directory.
+- Make sure the WASM file is copied to `dist/wasm_pkg/` or the correct location.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Deploying to Netlify
 
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+1. **Set build command:**
+   ```
+   npm run build
+   ```
+2. **Set publish directory:**
+   ```
+   dist
+   ```
+3. **WASM MIME type:**
+
+   - The file `public/_headers` ensures `.wasm` files are served with `Content-Type: application/wasm` (required for browsers to load WASM modules).
+
+4. **Drag-and-drop deploy:**
+   - You can also drag the `dist/` folder into Netlify's dashboard for manual deploys.
+
+## WASM Notes
+
+- If you update the Rust code, rebuild the WASM and ensure the new `.wasm` file is present in the output directory.
+- If you see MIME type errors, check the `_headers` file and WASM file location.
+
+## Credits
+
+- Made by [usman](https://linkedin.com/in/mir-usman)
