@@ -3,6 +3,60 @@
 import { create } from "zustand";
 import type { Graph, GraphEdge, GraphNode } from "@/extractor/types";
 import type { OpDescriptor, OpGraphPatch } from "@/ops/types";
+import type { Plan, Step, StepResult } from "@/lib/planSchema";
+import type { Rule, Violation } from "@/lib/rules";
+
+export type Insight = {
+  id: string;
+  title: string;
+  rationale: string;
+  severity: "low" | "medium" | "high";
+  targetIds: string[];
+  suggestedPrompt: string;
+};
+
+export type ConversationTurn = {
+  prompt: string;
+  intent?: string;
+  appliedSteps?: string[];
+};
+
+export type PlanState =
+  | { phase: "idle" }
+  | {
+      phase: "thinking";
+      prompt: string;
+      partial?: Partial<Plan> | null;
+    }
+  | {
+      phase: "preview";
+      prompt: string;
+      plan: Plan;
+    }
+  | {
+      phase: "running";
+      prompt: string;
+      plan: Plan;
+      results: StepResult[];
+      currentIndex: number;
+    }
+  | {
+      phase: "done";
+      prompt: string;
+      plan: Plan;
+      results: StepResult[];
+      ok: boolean;
+    };
+
+export type RepoOrigin =
+  | { kind: "local" }
+  | { kind: "github"; owner: string; repo: string; url: string };
+
+export type RepoReadmeInfo = {
+  found: boolean;
+  file?: string;
+  excerpt?: string;
+};
 
 export type Selection =
   | { kind: "node"; id: string }
@@ -56,9 +110,87 @@ type Store = {
 
   history: HistoryEntry[];
   failureFlash: { targetId: string; until: number } | null;
+  recentlyAdded: { nodeIds: Set<string>; edgeIds: Set<string>; until: number } | null;
+  changedNodeIds: Set<string>;
+  changedEdgeIds: Set<string>;
+  focusTargetIds: string[];
+  hoverHighlightIds: string[];
+  setHoverHighlight: (ids: string[]) => void;
+  sessionStats: { prompts: number; stepsApplied: number; filesChanged: number };
 
-  setRepoPath: (path: string) => void;
+  rightTab: "inspector" | "insights" | "rules" | "history";
+  setRightTab: (tab: "inspector" | "insights" | "rules" | "history") => void;
+
+  commandBarFocused: boolean;
+  setCommandBarFocused: (focused: boolean) => void;
+
+  rightPanelWidth: number;
+  setRightPanelWidth: (width: number) => void;
+
+  visibleKinds: Partial<Record<NodeKind, boolean>>;
+  toggleKind: (kind: NodeKind) => void;
+
+  rules: Rule[];
+  violations: Violation[];
+  rulesLoading: boolean;
+  ruleCompileError: string | null;
+  loadRules: () => Promise<void>;
+  addRuleFromPrompt: (prompt: string, severity?: Rule["severity"]) => Promise<void>;
+  removeRule: (id: string) => Promise<void>;
+  toggleRuleEnabled: (id: string, enabled: boolean) => Promise<void>;
+  applyRuleFix: (violation: Violation) => Promise<void>;
+
+  coveredNodeIds: Set<string>;
+  testFileCount: number;
+  coverageVisible: boolean;
+  toggleCoverage: () => void;
+  loadCoverage: () => Promise<void>;
+
+  planState: PlanState;
+  chatHistory: ConversationTurn[];
+  lastPrompt: string | null;
+  insights: Insight[];
+  insightsLoading: boolean;
+  submitPrompt: (prompt: string) => Promise<void>;
+  approvePlan: () => Promise<void>;
+  cancelPlan: () => void;
+  retryLastPrompt: () => Promise<void>;
+  loadInsights: () => Promise<void>;
+
+  // B: Step-by-step execution mode
+  stepByStepMode: boolean;
+  toggleStepByStep: () => void;
+  pendingContinue: (() => void) | null;
+  continueNextStep: () => void;
+
+  // F: Reiterative reasoning on failure
+  failureDecision: {
+    stepIndex: number;
+    resolve: (action: "retry" | "revise" | "skip" | "stop") => void;
+  } | null;
+  resolveFailure: (action: "retry" | "revise" | "skip" | "stop") => void;
+
+  // C: Graph annotations
+  executingTargetId: string | null;
+  graphSnapshot: Graph | null;
+  showGraphBefore: boolean;
+  toggleGraphBefore: () => void;
+
+  // D: Presenter mode
+  presenterMode: boolean;
+  togglePresenterMode: () => void;
+  fullscreenDiff: { diff: string; description: string; files: string[] } | null;
+  setFullscreenDiff: (d: { diff: string; description: string; files: string[] } | null) => void;
+
+  // E: Legend
+  showLegend: boolean;
+  dismissLegend: () => void;
+
+  setRepoSource: (source: "local" | "github") => void;
+  setRepoValue: (v: string) => void;
+  setRepoToken: (t: string) => void;
   loadGraph: () => Promise<void>;
+  resetDemo: () => Promise<void>;
   selectNode: (id: string) => void;
   selectEdge: (id: string) => void;
   clearSelection: () => void;
@@ -86,8 +218,713 @@ export const useStore = create<Store>((set, get) => ({
 
   history: [],
   failureFlash: null,
+  recentlyAdded: null,
+  changedNodeIds: new Set(),
+  changedEdgeIds: new Set(),
+  focusTargetIds: [],
+  hoverHighlightIds: [],
+  setHoverHighlight: (ids) => set({ hoverHighlightIds: ids }),
+  sessionStats: { prompts: 0, stepsApplied: 0, filesChanged: 0 },
 
-  setRepoPath: (p) => set({ repoPath: p }),
+  rightTab: "insights",
+  setRightTab: (tab) => set({ rightTab: tab }),
+
+  commandBarFocused: false,
+  setCommandBarFocused: (focused) => set({ commandBarFocused: focused }),
+
+  rightPanelWidth: 360,
+  setRightPanelWidth: (width) => {
+    const clamped = Math.min(720, Math.max(260, width));
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem("schema:rightPanelWidth", String(clamped));
+      } catch {
+        // ignore
+      }
+    }
+    set({ rightPanelWidth: clamped });
+  },
+
+  rules: [],
+  violations: [],
+  rulesLoading: false,
+  ruleCompileError: null,
+
+  coveredNodeIds: new Set(),
+  testFileCount: 0,
+  coverageVisible: false,
+  toggleCoverage: () => {
+    set((s) => ({ coverageVisible: !s.coverageVisible }));
+  },
+  async loadCoverage() {
+    const { resolvedRepoPath, graph } = get();
+    if (!graph) return;
+    try {
+      const res = await fetch("/api/coverage", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoPath: resolvedRepoPath, graph }),
+      });
+      const data = await res.json();
+      set({
+        coveredNodeIds: new Set<string>(
+          Array.isArray(data.coveredNodeIds) ? data.coveredNodeIds : [],
+        ),
+        testFileCount: typeof data.testFileCount === "number" ? data.testFileCount : 0,
+      });
+    } catch {
+      // ignore
+    }
+  },
+
+  async loadRules() {
+    const { resolvedRepoPath, graph } = get();
+    if (!graph) return;
+    set({ rulesLoading: true });
+    try {
+      const res = await fetch("/api/rules/violations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoPath: resolvedRepoPath, graph }),
+      });
+      const data = await res.json();
+      set({
+        rules: Array.isArray(data.rules) ? data.rules : [],
+        violations: Array.isArray(data.violations) ? data.violations : [],
+        rulesLoading: false,
+      });
+    } catch {
+      set({ rulesLoading: false });
+    }
+  },
+
+  async addRuleFromPrompt(prompt, severity = "warn") {
+    const { resolvedRepoPath } = get();
+    set({ ruleCompileError: null, rulesLoading: true });
+    try {
+      const compileRes = await fetch("/api/rules/compile", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const compiled = await compileRes.json();
+      if (!compileRes.ok || !compiled?.predicate) {
+        throw new Error(compiled?.error ?? "compile failed");
+      }
+      const rule: Rule = {
+        id: `rule:${Date.now().toString(36)}`,
+        title: compiled.title ?? prompt.slice(0, 80),
+        prompt,
+        predicate: compiled.predicate,
+        severity,
+        createdAt: Date.now(),
+        enabled: true,
+      };
+      const saveRes = await fetch("/api/rules/save", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "add",
+          repoPath: resolvedRepoPath,
+          rule,
+        }),
+      });
+      if (!saveRes.ok) {
+        const err = await saveRes.json().catch(() => ({}));
+        throw new Error(err?.error ?? "save failed");
+      }
+      await get().loadRules();
+    } catch (err) {
+      set({
+        ruleCompileError: err instanceof Error ? err.message : "rule failed",
+        rulesLoading: false,
+      });
+    }
+  },
+
+  async removeRule(id) {
+    const { resolvedRepoPath } = get();
+    await fetch("/api/rules/save", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "remove", repoPath: resolvedRepoPath, id }),
+    });
+    await get().loadRules();
+  },
+
+  async toggleRuleEnabled(id, enabled) {
+    const { resolvedRepoPath } = get();
+    await fetch("/api/rules/save", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "toggle",
+        repoPath: resolvedRepoPath,
+        id,
+        enabled,
+      }),
+    });
+    await get().loadRules();
+  },
+
+  async applyRuleFix(violation) {
+    const prompt = violation.suggestedPrompt ?? `Fix: ${violation.ruleTitle}`;
+    await get().submitPrompt(prompt);
+  },
+
+  visibleKinds: {
+    route_handler: true,
+    service: true,
+    data_access: true,
+    middleware: true,
+    model: true,
+    utility: true,
+    external: true,
+  },
+  toggleKind: (kind) =>
+    set((s) => ({
+      visibleKinds: {
+        ...s.visibleKinds,
+        [kind]: !(s.visibleKinds[kind] ?? true),
+      },
+    })),
+
+  planState: { phase: "idle" },
+  chatHistory: [],
+  lastPrompt: null,
+  insights: [],
+  insightsLoading: false,
+
+  // B: Step-by-step
+  stepByStepMode: true,
+  toggleStepByStep: () => set((s) => ({ stepByStepMode: !s.stepByStepMode })),
+  pendingContinue: null,
+  continueNextStep: () => {
+    const fn = get().pendingContinue;
+    if (fn) fn();
+  },
+
+  // F: Reiterative reasoning
+  failureDecision: null,
+  resolveFailure: (action) => {
+    const fd = get().failureDecision;
+    if (fd) fd.resolve(action);
+  },
+
+  // C: Graph annotations
+  executingTargetId: null,
+  graphSnapshot: null,
+  showGraphBefore: false,
+  toggleGraphBefore: () => set((s) => ({ showGraphBefore: !s.showGraphBefore })),
+
+  // D: Presenter mode
+  presenterMode: false,
+  togglePresenterMode: () => set((s) => ({ presenterMode: !s.presenterMode })),
+  fullscreenDiff: null,
+  setFullscreenDiff: (d) => set({ fullscreenDiff: d }),
+
+  // E: Legend
+  showLegend: true,
+  dismissLegend: () => set({ showLegend: false }),
+
+  async submitPrompt(prompt) {
+    const { graph, chatHistory } = get();
+    if (!graph || !prompt.trim()) return;
+    set({
+      planState: { phase: "thinking", prompt, partial: null },
+      lastPrompt: prompt,
+    });
+    try {
+      const res = await fetch("/api/plan/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          graph,
+          history: chatHistory.slice(-3),
+          stream: true,
+        }),
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error ?? `plan failed (${res.status})`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalPlan: Plan | null = null;
+      let streamError: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let payload: { type: string; plan?: Partial<Plan>; error?: string };
+          try {
+            payload = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (payload.type === "partial") {
+            const cur = get().planState;
+            if (cur.phase === "thinking") {
+              set({
+                planState: {
+                  phase: "thinking",
+                  prompt: cur.prompt,
+                  partial: payload.plan ?? null,
+                },
+              });
+            }
+          } else if (payload.type === "final" && payload.plan) {
+            finalPlan = payload.plan as Plan;
+          } else if (payload.type === "error") {
+            streamError = payload.error ?? "stream error";
+          }
+        }
+      }
+
+      if (streamError) throw new Error(streamError);
+      if (!finalPlan) throw new Error("no plan returned");
+      set({ planState: { phase: "preview", prompt, plan: finalPlan } });
+    } catch (err) {
+      set({
+        planState: { phase: "idle" },
+        applyState: {
+          phase: "error",
+          opName: "plan",
+          diff: "",
+          error: err instanceof Error ? err.message : "plan failed",
+          filesChanged: [],
+        },
+        lastPrompt: prompt,
+      });
+    }
+  },
+
+  async approvePlan() {
+    const state = get();
+    const ps = state.planState;
+    if (ps.phase !== "preview") return;
+    const { plan, prompt } = ps;
+    const results: StepResult[] = plan.steps.map((s) => ({
+      status: "pending",
+      description: s.description,
+    }));
+
+    // C: Snapshot graph for before/after toggle
+    set({
+      planState: {
+        phase: "running",
+        prompt,
+        plan,
+        results,
+        currentIndex: 0,
+      },
+      graphSnapshot: structuredClone(state.graph),
+      showGraphBefore: false,
+      changedNodeIds: new Set(),
+      changedEdgeIds: new Set(),
+    });
+
+    let ok = true;
+    let workingGraph = state.graph!;
+    const appliedDescriptions: string[] = [];
+    const focusIds = plan.steps
+      .filter((s): s is Extract<typeof s, { kind: "op" }> => s.kind === "op")
+      .map((s) => s.targetId);
+    set({ focusTargetIds: focusIds });
+
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i]!;
+      const cur = get().planState;
+      if (cur.phase !== "running") return; // cancelled
+
+      // C: Highlight target node during execution
+      const targetId = step.kind === "op" ? step.targetId : null;
+      set({ executingTargetId: targetId });
+
+      const newResults = [...cur.results];
+      newResults[i] = { ...newResults[i]!, status: "running" };
+      set({
+        planState: { ...cur, results: newResults, currentIndex: i },
+      });
+
+      try {
+        const res = await fetch("/api/plan/execute-step-stream", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            repoPath: get().resolvedRepoPath,
+            graph: workingGraph,
+            step,
+            intent: prompt,
+          }),
+        });
+        if (!res.ok || !res.body) {
+          throw new Error("execute-step request failed");
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let live = "";
+        let data: Record<string, unknown> | null = null;
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buf += decoder.decode(chunk.value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let ev: Record<string, unknown>;
+            try {
+              ev = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if (ev.type === "test_output" && typeof ev.chunk === "string") {
+              live += ev.chunk;
+              const cur = get().planState;
+              if (cur.phase === "running") {
+                const rr = [...cur.results];
+                rr[i] = {
+                  ...rr[i]!,
+                  status: "running",
+                  testOutputLive: live,
+                };
+                set({ planState: { ...cur, results: rr } });
+              }
+            } else if (ev.type === "phase") {
+              const cur = get().planState;
+              if (cur.phase === "running") {
+                const rr = [...cur.results];
+                rr[i] = {
+                  ...rr[i]!,
+                  status: "running",
+                  phase: ev.phase as StepResult["phase"],
+                };
+                set({ planState: { ...cur, results: rr } });
+              }
+            } else if (ev.type === "diff") {
+              const cur = get().planState;
+              if (cur.phase === "running") {
+                const rr = [...cur.results];
+                rr[i] = {
+                  ...rr[i]!,
+                  status: "running",
+                  diff: ev.diff as string,
+                  filesChanged: ev.filesChanged as string[],
+                };
+                set({ planState: { ...cur, results: rr } });
+              }
+            } else if (ev.type === "result") {
+              data = ev;
+            }
+          }
+        }
+        if (!data) {
+          throw new Error("no result from stream");
+        }
+        const cur2 = get().planState;
+        if (cur2.phase !== "running") return;
+        const r2 = [...cur2.results];
+        if (data.ok) {
+          r2[i] = {
+            status: "success",
+            description: (data.description as string) ?? step.description,
+            diff: data.diff as string | undefined,
+            filesChanged: data.filesChanged as string[] | undefined,
+            testOutput: data.testOutput as string | undefined,
+            intentCheck: data.intentCheck as
+              | { matches: boolean; reason: string }
+              | undefined,
+          };
+          if (data.graphPatch) {
+            workingGraph = applyPatch(
+              workingGraph,
+              data.graphPatch as OpGraphPatch,
+            );
+            // re-evaluate rules whenever graph changes
+            void get().loadRules();
+            const patch = data.graphPatch as OpGraphPatch;
+            const newNodeIds = new Set<string>(
+              (patch.addNodes ?? []).map((n) => n.id),
+            );
+            const newEdgeIds = new Set<string>(
+              (patch.addEdges ?? []).map((e) => e.id),
+            );
+            // Accumulate persistent changed sets + short flash
+            const prevChanged = get().changedNodeIds;
+            const prevChangedEdges = get().changedEdgeIds;
+            set({
+              graph: workingGraph,
+              recentlyAdded: {
+                nodeIds: newNodeIds,
+                edgeIds: newEdgeIds,
+                until: Date.now() + 6000,
+              },
+              changedNodeIds: new Set([...prevChanged, ...newNodeIds]),
+              changedEdgeIds: new Set([...prevChangedEdges, ...newEdgeIds]),
+            });
+          }
+          appliedDescriptions.push(step.description);
+        } else {
+          // F: Reiterative reasoning — ask user what to do on failure
+          r2[i] = {
+            status: "failure",
+            description: step.description,
+            diff: (data.diff as string) ?? "",
+            filesChanged: (data.filesChanged as string[]) ?? [],
+            testOutput: data.testOutput as string | undefined,
+            error: data.error as string,
+            explanation: data.explanation as string | undefined,
+          };
+          set({ planState: { ...cur2, results: r2, currentIndex: i }, executingTargetId: null });
+
+          // Wait for user decision
+          const action = await new Promise<"retry" | "revise" | "skip" | "stop">((resolve) => {
+            set({ failureDecision: { stepIndex: i, resolve } });
+          });
+          set({ failureDecision: null });
+
+          if (get().planState.phase !== "running") return; // cancelled while waiting
+
+          if (action === "stop") {
+            ok = false;
+            const curStop = get().planState;
+            if (curStop.phase !== "running") return;
+            const rStop = [...curStop.results];
+            for (let j = i + 1; j < rStop.length; j++) {
+              rStop[j] = { ...rStop[j]!, status: "skipped" };
+            }
+            set({ planState: { ...curStop, results: rStop, currentIndex: i } });
+            break;
+          } else if (action === "skip") {
+            // Mark as skipped and continue
+            const curSkip = get().planState;
+            if (curSkip.phase !== "running") return;
+            const rSkip = [...curSkip.results];
+            rSkip[i] = { ...rSkip[i]!, status: "skipped" };
+            set({ planState: { ...curSkip, results: rSkip, currentIndex: i } });
+            continue;
+          } else if (action === "retry" || action === "revise") {
+            // Reset step to pending and re-run
+            const curRetry = get().planState;
+            if (curRetry.phase !== "running") return;
+            const rRetry = [...curRetry.results];
+            rRetry[i] = { ...rRetry[i]!, status: "pending" };
+            set({ planState: { ...curRetry, results: rRetry, currentIndex: i } });
+
+            if (action === "revise") {
+              // Ask LLM to revise the step based on the error
+              try {
+                const revised = await reviseStep(
+                  get().resolvedRepoPath,
+                  workingGraph,
+                  step,
+                  data.error as string,
+                  data.explanation as string | undefined,
+                  data.testOutput as string | undefined,
+                  prompt,
+                );
+                if (revised) {
+                  plan.steps[i] = revised;
+                }
+              } catch {
+                // revision failed, will retry original step
+              }
+            }
+            i--; // decrement so the loop re-runs this step
+            continue;
+          }
+        }
+        set({ planState: { ...cur2, results: r2, currentIndex: i }, executingTargetId: null });
+
+        // B: Step-by-step mode — pause between steps
+        if (data.ok && get().stepByStepMode && i < plan.steps.length - 1) {
+          await new Promise<void>((resolve) => {
+            set({ pendingContinue: resolve });
+          });
+          set({ pendingContinue: null });
+          if (get().planState.phase !== "running") return; // cancelled while paused
+        }
+      } catch (err) {
+        // F: Even on network/parse errors, ask user what to do
+        const cur3 = get().planState;
+        if (cur3.phase !== "running") return;
+        const r3 = [...cur3.results];
+        r3[i] = {
+          status: "failure",
+          description: step.description,
+          error: err instanceof Error ? err.message : "request failed",
+        };
+        set({ planState: { ...cur3, results: r3, currentIndex: i }, executingTargetId: null });
+
+        const action = await new Promise<"retry" | "revise" | "skip" | "stop">((resolve) => {
+          set({ failureDecision: { stepIndex: i, resolve } });
+        });
+        set({ failureDecision: null });
+
+        if (get().planState.phase !== "running") return;
+
+        if (action === "stop") {
+          ok = false;
+          const rStop = [...(get().planState as { results: StepResult[] }).results];
+          for (let j = i + 1; j < rStop.length; j++) {
+            rStop[j] = { ...rStop[j]!, status: "skipped" };
+          }
+          set({ planState: { ...get().planState as Extract<PlanState, { phase: "running" }>, results: rStop, currentIndex: i } });
+          break;
+        } else if (action === "skip") {
+          const curS = get().planState;
+          if (curS.phase !== "running") return;
+          const rS = [...curS.results];
+          rS[i] = { ...rS[i]!, status: "skipped" };
+          set({ planState: { ...curS, results: rS } });
+          continue;
+        } else {
+          // retry or revise
+          const curR = get().planState;
+          if (curR.phase !== "running") return;
+          const rR = [...curR.results];
+          rR[i] = { ...rR[i]!, status: "pending" };
+          set({ planState: { ...curR, results: rR } });
+          i--;
+          continue;
+        }
+      }
+    }
+
+    const final = get().planState;
+    if (final.phase !== "running") return;
+    const stepsApplied = final.results.filter((r) => r.status === "success").length;
+    const filesTouched = new Set<string>();
+    for (const r of final.results) {
+      for (const f of r.filesChanged ?? []) filesTouched.add(f);
+    }
+    const prevStats = get().sessionStats;
+    set({
+      planState: {
+        phase: "done",
+        prompt,
+        plan,
+        results: final.results,
+        ok,
+      },
+      focusTargetIds: [],
+      executingTargetId: null,
+      pendingContinue: null,
+      chatHistory: [
+        ...get().chatHistory,
+        { prompt, intent: plan.intent, appliedSteps: appliedDescriptions },
+      ],
+      sessionStats: {
+        prompts: prevStats.prompts + 1,
+        stepsApplied: prevStats.stepsApplied + stepsApplied,
+        filesChanged: prevStats.filesChanged + filesTouched.size,
+      },
+    });
+    // If any freeform steps succeeded, the on-disk code changed but the
+    // in-memory graph still has stale edges. Re-extract to get the real graph.
+    const hadFreeform = plan.steps.some((s, i) =>
+      s.kind === "freeform" && final.results[i]?.status === "success",
+    );
+    if (hadFreeform && filesTouched.size > 0) {
+      // Re-extract graph from the modified source files
+      try {
+        const res = await fetch("/api/extract", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            source: get().repoSource,
+            value: get().repoValue,
+            skipCache: true,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          set({
+            graph: data.graph,
+            summary: data.summary ?? get().summary,
+            clusterSource: data.clusterSource,
+          });
+        }
+      } catch {
+        // ignore — stale graph is better than no graph
+      }
+    }
+    // Refresh insights and rules against the (now-current) graph
+    void get().loadInsights();
+    void get().loadRules();
+  },
+
+  cancelPlan() {
+    const fn = get().pendingContinue;
+    if (fn) fn(); // unblock the paused loop so it exits cleanly
+    const fd = get().failureDecision;
+    if (fd) fd.resolve("stop"); // unblock failure decision
+    set({ planState: { phase: "idle" }, focusTargetIds: [], executingTargetId: null, pendingContinue: null, failureDecision: null });
+  },
+
+  async retryLastPrompt() {
+    const last = get().lastPrompt;
+    if (!last) return;
+    set({
+      applyState: { phase: "idle" },
+      planState: { phase: "idle" },
+    });
+    await get().submitPrompt(last);
+  },
+
+  async loadInsights() {
+    const { graph } = get();
+    if (!graph) return;
+    set({ insightsLoading: true });
+    try {
+      const res = await fetch("/api/insights", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph }),
+      });
+      const data = await res.json();
+      set({
+        insights: Array.isArray(data.insights) ? data.insights : [],
+        insightsLoading: false,
+      });
+    } catch {
+      set({ insightsLoading: false });
+    }
+  },
+
+  setRepoSource: (source) => set({ repoSource: source }),
+  setRepoValue: (v) => set({ repoValue: v }),
+  setRepoToken: (t) => set({ repoToken: t }),
+
+  async resetDemo() {
+    try {
+      await fetch("/api/demo-reset", { method: "POST" });
+      // Clear all state and re-extract
+      set({
+        graph: null,
+        planState: { phase: "idle" },
+        chatHistory: [],
+        insights: [],
+        changedNodeIds: new Set(),
+        changedEdgeIds: new Set(),
+        graphSnapshot: null,
+        sessionStats: { prompts: 0, stepsApplied: 0, filesChanged: 0 },
+      });
+      await get().loadGraph();
+    } catch {
+      // ignore
+    }
+  },
 
   async loadGraph() {
     set({ loading: true, loadError: null });
@@ -294,16 +1131,57 @@ function paramsForApi(
   return flat;
 }
 
+async function reviseStep(
+  repoPath: string,
+  graph: Graph,
+  failedStep: Step,
+  error: string,
+  explanation: string | undefined,
+  testOutput: string | undefined,
+  originalPrompt: string,
+): Promise<Step | null> {
+  try {
+    const res = await fetch("/api/plan/revise-step", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repoPath,
+        graph,
+        step: failedStep,
+        error,
+        explanation,
+        testOutput: testOutput ? testOutput.split("\n").slice(-40).join("\n") : undefined,
+        originalPrompt,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.step ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function applyPatch(graph: Graph, patch: OpGraphPatch): Graph {
   const nodes: GraphNode[] = patch.removeNodes
     ? graph.nodes.filter((n) => !patch.removeNodes!.includes(n.id))
     : [...graph.nodes];
-  if (patch.addNodes) nodes.push(...patch.addNodes);
+  if (patch.addNodes) {
+    const existingIds = new Set(nodes.map((n) => n.id));
+    for (const n of patch.addNodes) {
+      if (!existingIds.has(n.id)) nodes.push(n);
+    }
+  }
 
   const edges: GraphEdge[] = patch.removeEdges
     ? graph.edges.filter((e) => !patch.removeEdges!.includes(e.id))
     : [...graph.edges];
-  if (patch.addEdges) edges.push(...patch.addEdges);
+  if (patch.addEdges) {
+    const existingIds = new Set(edges.map((e) => e.id));
+    for (const e of patch.addEdges) {
+      if (!existingIds.has(e.id)) edges.push(e);
+    }
+  }
 
   return { ...graph, nodes, edges };
 }
